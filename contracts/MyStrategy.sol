@@ -10,25 +10,31 @@ import "../deps/@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol
 import "../deps/@openzeppelin/contracts-upgradeable/token/ERC20/SafeERC20Upgradeable.sol";
 
 import "../interfaces/badger/IController.sol";
+import "../interfaces/kyber/kyber.sol";
+import "../interfaces/kyber/IKyberFairLaunch.sol";
 
 import {BaseStrategy} from "../deps/BaseStrategy.sol";
 
-contract MyStrategy is BaseStrategy {
+contract StrategyKyberBadgerWBtcUsdt is BaseStrategy {
     using SafeERC20Upgradeable for IERC20Upgradeable;
     using AddressUpgradeable for address;
     using SafeMathUpgradeable for uint256;
 
     // address public want // Inherited from BaseStrategy, the token the strategy wants, swaps into and tries to grow
-    address public lpComponent; // Token we provide liquidity with
+    // we provide liquidity with want
     address public reward; // Token we farm and swap to want / lpComponent
 
-    // Used to signal to the Badger Tree that rewards where sent to it
-    event TreeDistribution(
-        address indexed token,
-        uint256 amount,
-        uint256 indexed blockNumber,
-        uint256 timestamp
-    );
+    address public constant STAKING_REWARDS =
+        0x31de05f28568e3d3d612bfa6a78b356676367470;
+    address public constant KYBER_ROUTER =
+        0x1c87257f5e8609940bc751a07bb085bb7f8cdbe6;
+
+    address public constant wbtc = 0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6;
+    address public constant usdt = 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174;
+    address public constant weth = 0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619;
+
+    uint256 public slippage;
+    uint256 public constant MAX_BPS = 10000;
 
     function initialize(
         address _governance,
@@ -36,7 +42,7 @@ contract MyStrategy is BaseStrategy {
         address _controller,
         address _keeper,
         address _guardian,
-        address[3] memory _wantConfig,
+        address[2] memory _wantConfig,
         uint256[3] memory _feeConfig
     ) public initializer {
         __BaseStrategy_init(
@@ -49,22 +55,26 @@ contract MyStrategy is BaseStrategy {
 
         /// @dev Add config here
         want = _wantConfig[0];
-        lpComponent = _wantConfig[1];
-        reward = _wantConfig[2];
+        reward = _wantConfig[1];
 
         performanceFeeGovernance = _feeConfig[0];
         performanceFeeStrategist = _feeConfig[1];
         withdrawalFee = _feeConfig[2];
 
+        // Set the default slippage tolerance to 5% (divide by MAX_BPS)
+        slippage = 50;
+
         /// @dev do one off approvals here
-        // IERC20Upgradeable(want).safeApprove(gauge, type(uint256).max);
+        IERC20Upgradeable(want).safeApprove(STAKING_REWARDS, type(uint256).max);
+
+        IERC20Upgradeable(reward).safeApprove(KYBER_ROUTER, type(uint256).max);
     }
 
     /// ===== View Functions =====
 
     // @dev Specify the name of the strategy
     function getName() external pure override returns (string memory) {
-        return "StrategyName";
+        return "StrategyKyberBadgerWBtcUsdt";
     }
 
     // @dev Specify the version of the Strategy, for upgrades
@@ -74,7 +84,11 @@ contract MyStrategy is BaseStrategy {
 
     /// @dev Balance of want currently held in strategy positions
     function balanceOfPool() public view override returns (uint256) {
-        return 0;
+        return IKyberFairLaunch(STAKING_REWARDS).balanceOf(address(this));
+    }
+
+    function balanceOfToken(address _token) public view returns (uint256) {
+        return IERC20Upgradeable(_token).balanceOf(address(this));
     }
 
     /// @dev Returns true if this strategy requires tending
@@ -89,10 +103,11 @@ contract MyStrategy is BaseStrategy {
         override
         returns (address[] memory)
     {
-        address[] memory protectedTokens = new address[](3);
+        address[] memory protectedTokens = new address[](4);
         protectedTokens[0] = want;
-        protectedTokens[1] = lpComponent;
-        protectedTokens[2] = reward;
+        protectedTokens[1] = reward;
+        protectedTokens[2] = STAKING_REWARDS;
+        protectedTokens[3] = weth;
         return protectedTokens;
     }
 
@@ -119,10 +134,18 @@ contract MyStrategy is BaseStrategy {
     /// @dev invest the amount of want
     /// @notice When this function is called, the controller has already sent want to this
     /// @notice Just get the current balance and then invest accordingly
-    function _deposit(uint256 _amount) internal override {}
+    /// @notice stake the want tokens in the LP pool
+    function _deposit(uint256 _amount) internal override {
+        IKyberFairLaunch(STAKING_REWARDS).deposit(1, _amount, false);
+    }
 
     /// @dev utility function to withdraw everything for migration
-    function _withdrawAll() internal override {}
+    function _withdrawAll() internal override {
+        uint256 _totalWant = balanceOfPool();
+        if (_totalWant > 0) {
+            _withdrawSome(_totalWant);
+        }
+    }
 
     /// @dev withdraw the specified amount of want, liquidate from lpComponent to want, paying off any necessary debt for the conversion
     function _withdrawSome(uint256 _amount)
@@ -130,7 +153,20 @@ contract MyStrategy is BaseStrategy {
         override
         returns (uint256)
     {
+        uint256 _totalWant = balanceOfPool();
+        if (_amount > _totalWant) {
+            _amount = _totalWant;
+        }
+        IKyberFairLaunch(STAKING_REWARDS).withdraw(1, _amount);
         return _amount;
+    }
+
+    /// @notice check unclaimed kyber rewards
+    function checkPendingReward() public view returns (uint256) {
+        return
+            IKyberFairLaunch(STAKING_REWARDS).pendingRewards(1, address(this))[
+                0
+            ];
     }
 
     /// @dev Harvest from strategy mechanics, realizing increase in underlying position
@@ -139,7 +175,17 @@ contract MyStrategy is BaseStrategy {
 
         uint256 _before = IERC20Upgradeable(want).balanceOf(address(this));
 
-        // Write your code here
+        uint256 _reward = checkPendingReward();
+
+        if (_reward == 0) {
+            return 0;
+        }
+
+        // take out reward kyber tokens
+        IKyberFairLaunch(STAKING_REWARDS).harvest(1);
+
+        // exchange kyber tokens for WBTC-USDC tokens
+        _kncToLP();
 
         uint256 earned =
             IERC20Upgradeable(want).balanceOf(address(this)).sub(_before);
@@ -148,40 +194,20 @@ contract MyStrategy is BaseStrategy {
         (uint256 governancePerformanceFee, uint256 strategistPerformanceFee) =
             _processPerformanceFees(earned);
 
-        // TODO: If you are harvesting a reward token you're not compounding
-        // You probably still want to capture fees for it
-        // // Process Sushi rewards if existing
-        // if (sushiAmount > 0) {
-        //     // Process fees on Sushi Rewards
-        //     // NOTE: Use this to receive fees on the reward token
-        //     _processRewardsFees(sushiAmount, SUSHI_TOKEN);
-
-        //     // Transfer balance of Sushi to the Badger Tree
-        //     // NOTE: Send reward to badgerTree
-        //     uint256 sushiBalance = IERC20Upgradeable(SUSHI_TOKEN).balanceOf(address(this));
-        //     IERC20Upgradeable(SUSHI_TOKEN).safeTransfer(badgerTree, sushiBalance);
-        //
-        //     // NOTE: Signal the amount of reward sent to the badger tree
-        //     emit TreeDistribution(SUSHI_TOKEN, sushiBalance, block.number, block.timestamp);
-        // }
-
         /// @dev Harvest event that every strategy MUST have, see BaseStrategy
         emit Harvest(earned, block.number);
 
-        /// @dev Harvest must return the amount of want increased
         return earned;
     }
-
-    // Alternative Harvest with Price received from harvester, used to avoid exessive front-running
-    function harvest(uint256 price)
-        external
-        whenNotPaused
-        returns (uint256 harvested)
-    {}
 
     /// @dev Rebalance, Compound or Pay off debt here
     function tend() external whenNotPaused {
         _onlyAuthorizedActors();
+        // restake want into the rewards contract
+        uint256 _want = balanceOfWant();
+        if (_want > 0) {
+            _deposit(_want);
+        }
     }
 
     /// ===== Internal Helper Functions =====
@@ -209,23 +235,53 @@ contract MyStrategy is BaseStrategy {
         );
     }
 
-    /// @dev used to manage the governance and strategist fee on earned rewards, make sure to use it to get paid!
-    function _processRewardsFees(uint256 _amount, address _token)
-        internal
-        returns (uint256 governanceRewardsFee, uint256 strategistRewardsFee)
-    {
-        governanceRewardsFee = _processFee(
-            _token,
-            _amount,
-            performanceFeeGovernance,
-            IController(controller).rewards()
+    /// @dev KNC TO WBTC-USDC LP
+    function _kncToLP() internal {
+        uint256 _tokens = balanceOfToken(reward);
+        uint256 _half = _tokens.mul(5000).div(MAX_BPS);
+
+        // kyber to weth to wbtc
+        address[] memory path = new address[](3);
+        path[0] = reward;
+        path[1] = weth;
+        path[2] = wbtc;
+        kyber(KYBER_ROUTER).swapExactTokensForTokens(
+            _half,
+            0,
+            path,
+            address(this),
+            now
         );
 
-        strategistRewardsFee = _processFee(
-            _token,
-            _amount,
-            performanceFeeStrategist,
-            strategist
+        // kyber to usdt
+        path = new address[](2);
+        path[0] = reward;
+        path[1] = usdt;
+        kyber(KYBER_ROUTER).swapExactTokensForTokens(
+            _tokens.sub(_half),
+            0,
+            path,
+            address(this),
+            now
         );
+
+        uint256 _wbtcIn = balanceOfToken(wbtc);
+        uint256 _usdcIn = balanceOfToken(usdt);
+        // add to WBTC-USDC LP pool for pool tokens
+        kyber(KYBER_ROUTER).addLiquidity(
+            wbtc,
+            usdt,
+            _wbtcIn,
+            _usdcIn,
+            _wbtcIn.mul(slippage).div(MAX_BPS),
+            _usdcIn.mul(slippage).div(MAX_BPS),
+            address(this),
+            now
+        );
+    }
+
+    function setSlippageTolerance(uint256 _s) external {
+        _onlyGovernanceOrStrategist();
+        slippage = _s;
     }
 }

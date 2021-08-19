@@ -9,6 +9,6 @@ autofetch_sources: True
 # path remapping to support imports from GitHub/NPM
 compiler:
   solc:
-    version: 0.6.12
+    version: 0.7.6
 
 reports:
